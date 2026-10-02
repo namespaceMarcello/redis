@@ -2055,7 +2055,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 
     /* Send the invalidation messages to clients participating to the
      * client side caching protocol in broadcasting (BCAST) mode. */
-    trackingBroadcastInvalidationMessages(NULL);
+    trackingHandleBroadcastInBeforeSleep();
 
     /* Record time consumption of AOF writing. */
     monotime aof_start_time = getMonotonicUs();
