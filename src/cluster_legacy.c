@@ -94,6 +94,7 @@ int auxTlsPortSetter(clusterNode *n, void *value, int length);
 sds auxTlsPortGetter(clusterNode *n, sds s);
 int auxTlsPortPresent(clusterNode *n);
 static void clusterBuildMessageHdr(clusterMsg *hdr, int type, size_t msglen);
+static void clusterBuildMessageHdrLight(clusterMsgLight *hdr, int type, size_t msglen);
 void freeClusterLink(clusterLink *link);
 int verifyClusterNodeId(const char *name, int length);
 static void updateShardId(clusterNode *node, const char *shard_id);
@@ -120,6 +121,13 @@ static inline int defaultClientPort(void) {
 
 #define RCVBUF_INIT_LEN 1024
 #define RCVBUF_MAX_PREALLOC (1<<20) /* 1MB */
+/* Bytes read before the rest of a message: enough for its signature, length
+ * and type, with either header. */
+#define RCVBUF_MIN_READ_LEN 16
+static_assert(offsetof(clusterMsg, type) + sizeof(uint16_t) <= RCVBUF_MIN_READ_LEN,
+              "The type must be read with the first bytes of a message");
+static_assert(RCVBUF_MIN_READ_LEN <= CLUSTERMSG_LIGHT_MIN_LEN,
+              "The first bytes read must not exceed the shortest message");
 
 /* Cluster nodes hash table, mapping nodes addresses 1.2.3.4:6379 to
  * clusterNode structures. */
@@ -297,6 +305,11 @@ typedef struct {
 /* Helper function to extract a normal message from a send block. */
 static clusterMsg *getMessageFromSendBlock(clusterMsgSendBlock *msgblock) {
     return &msgblock->msg[0];
+}
+
+/* Helper function to extract a message with the light header from a send block. */
+static clusterMsgLight *getLightMessageFromSendBlock(clusterMsgSendBlock *msgblock) {
+    return (clusterMsgLight *) &msgblock->msg[0];
 }
 
 /* -----------------------------------------------------------------------------
@@ -1153,13 +1166,19 @@ void clusterReset(int hard) {
 /* -----------------------------------------------------------------------------
  * CLUSTER communication link
  * -------------------------------------------------------------------------- */
+/* Create a send block for a message of 'type' and 'msglen' bytes, header
+ * included. If 'type' has the CLUSTERMSG_LIGHT bit set, the message gets the
+ * light header (clusterMsgLight) instead of the full one. */
 static clusterMsgSendBlock *createClusterMsgSendBlock(int type, uint32_t msglen) {
     uint32_t blocklen = msglen + sizeof(clusterMsgSendBlock);
     clusterMsgSendBlock *msgblock = zcalloc(blocklen);
     msgblock->refcount = 1;
     msgblock->totlen = blocklen;
     server.stat_cluster_links_memory += blocklen;
-    clusterBuildMessageHdr(getMessageFromSendBlock(msgblock),type,msglen);
+    if (type & CLUSTERMSG_LIGHT)
+        clusterBuildMessageHdrLight(getLightMessageFromSendBlock(msgblock),type,msglen);
+    else
+        clusterBuildMessageHdr(getMessageFromSendBlock(msgblock),type,msglen);
     return msgblock;
 }
 
@@ -1187,6 +1206,7 @@ clusterLink *createClusterLink(clusterNode *node) {
     link->node = node;
     /* Related node can only possibly be known at link creation time if this is an outbound link */
     link->inbound = (node == NULL);
+    link->light_hdr_supported = 0;
     if (!link->inbound) {
         node->link = link;
     }
@@ -2802,6 +2822,80 @@ static clusterNode *getNodeFromLinkAndMsg(clusterLink *link, clusterMsg *hdr) {
     return sender;
 }
 
+/* Return the length that a PUBLISH or PUBLISHSHARD message must have, given
+ * the length of its header and the lengths it declares, or 0 if those lengths
+ * overflow (the message is then invalid, and a warning is logged). */
+static uint32_t clusterPublishMsgExpectedLen(clusterMsgDataPublish *msg, uint32_t hdrlen, uint16_t type) {
+    uint32_t ch_len = ntohl(msg->channel_len);
+    uint32_t msg_len = ntohl(msg->message_len);
+    uint32_t explen = hdrlen + sizeof(clusterMsgDataPublish) - 8;
+    if (ch_len > UINT32_MAX - explen || msg_len > UINT32_MAX - explen - ch_len) {
+        serverLog(LL_WARNING, "Received invalid %s packet with overflow in length fields "
+            "(channel_len:%u, message_len:%u)", clusterGetMessageTypeString(type), ch_len, msg_len);
+        return 0;
+    }
+    return explen + ch_len + msg_len;
+}
+
+/* Deliver a PUBLISH or PUBLISHSHARD message received from another node to
+ * our subscribers. */
+static void clusterProcessPublishPacket(clusterMsgDataPublish *msg, uint16_t type) {
+    robj *channel, *message;
+    uint32_t channel_len, message_len;
+
+    /* Don't bother creating useless objects if there are no
+     * Pub/Sub subscribers. */
+    if ((type == CLUSTERMSG_TYPE_PUBLISH
+        && serverPubsubSubscriptionCount() > 0)
+    || (type == CLUSTERMSG_TYPE_PUBLISHSHARD
+        && serverPubsubShardSubscriptionCount() > 0))
+    {
+        channel_len = ntohl(msg->channel_len);
+        message_len = ntohl(msg->message_len);
+        channel = createStringObject((char*)msg->bulk_data,channel_len);
+        message = createStringObject((char*)msg->bulk_data+channel_len,message_len);
+        pubsubPublishMessage(channel, message, type == CLUSTERMSG_TYPE_PUBLISHSHARD);
+        decrRefCount(channel);
+        decrRefCount(message);
+    }
+}
+
+/* Process a packet with the light header (clusterMsgLight), whose type has
+ * already been stripped of the CLUSTERMSG_LIGHT bit. Only Pub/Sub messages use
+ * it. They carry nothing about the cluster state, so all we do is to deliver
+ * them, if we know the sender, as for the full header. The link always stays
+ * valid: the function returns 1. */
+static int clusterProcessLightPacket(clusterLink *link, uint16_t type, mstime_t now) {
+    clusterMsgLight *hdr = (clusterMsgLight*) link->rcvbuf;
+    uint32_t totlen = ntohl(hdr->totlen);
+    uint32_t minlen = CLUSTERMSG_LIGHT_MIN_LEN + sizeof(clusterMsgDataPublish) - 8;
+
+    if (type != CLUSTERMSG_TYPE_PUBLISH && type != CLUSTERMSG_TYPE_PUBLISHSHARD) {
+        serverLog(LL_WARNING, "Received a light header packet of type %s, "
+            "which only Pub/Sub packets can use", clusterGetMessageTypeString(type));
+        return 1;
+    }
+    /* The lengths of channel and message must be within the packet. */
+    uint32_t explen = totlen < minlen ? minlen :
+        clusterPublishMsgExpectedLen(&hdr->data.publish.msg, CLUSTERMSG_LIGHT_MIN_LEN, type);
+    if (explen == 0) return 1;
+    if (totlen != explen) {
+        serverLog(LL_WARNING, "Received invalid light %s packet of length %lld but expected length %lld",
+            clusterGetMessageTypeString(type), (unsigned long long) totlen, (unsigned long long) explen);
+        return 1;
+    }
+
+    /* The sender is found as for the full header, but a light packet never
+     * associates an inbound link with a node (and so never replaces the link
+     * of that node): the next full message on the link does. */
+    clusterNode *sender = (link->node && !nodeInHandshake(link->node)) ?
+        link->node : clusterLookupNode(hdr->sender, CLUSTER_NAMELEN);
+    if (!sender) return 1;  /* We don't know that node. */
+    sender->data_received = now;
+    clusterProcessPublishPacket(&hdr->data.publish.msg, type);
+    return 1;
+}
+
 /* When this function is called, there is a packet to process starting
  * at link->rcvbuf. Releasing the buffer is up to the caller, so this
  * function should just handle the higher level stuff of processing the
@@ -2815,8 +2909,10 @@ int clusterProcessPacket(clusterLink *link) {
     clusterMsg *hdr = (clusterMsg*) link->rcvbuf;
     uint32_t totlen = ntohl(hdr->totlen);
     uint16_t type = ntohs(hdr->type);
+    int light = type & CLUSTERMSG_LIGHT;
     mstime_t now = mstime();
 
+    type &= ~CLUSTERMSG_LIGHT;
     if (type < CLUSTERMSG_TYPE_COUNT)
         server.cluster->stats_bus_messages_received[type]++;
     serverLog(LL_DEBUG,"--- Processing packet of type %s, %lu bytes",
@@ -2835,6 +2931,9 @@ int clusterProcessPacket(clusterLink *link) {
         serverLog(LL_WARNING, "Dropping packet that matches debug drop filter");
         return 1;
     }
+
+    /* The fields below are only in the full header. */
+    if (light) return clusterProcessLightPacket(link, type, now);
 
     uint16_t flags = ntohs(hdr->flags);
     uint16_t extensions = ntohs(hdr->extensions);
@@ -2911,16 +3010,8 @@ int clusterProcessPacket(clusterLink *link) {
         explen = sizeof(clusterMsg)-sizeof(union clusterMsgData);
         explen += sizeof(clusterMsgDataFail);
     } else if (type == CLUSTERMSG_TYPE_PUBLISH || type == CLUSTERMSG_TYPE_PUBLISHSHARD) {
-        uint32_t ch_len = ntohl(hdr->data.publish.msg.channel_len);
-        uint32_t msg_len = ntohl(hdr->data.publish.msg.message_len);
-        explen = sizeof(clusterMsg)-sizeof(union clusterMsgData);
-        explen += sizeof(clusterMsgDataPublish) - 8;
-        if (ch_len > UINT32_MAX - explen || msg_len > UINT32_MAX - explen - ch_len) {
-            serverLog(LL_WARNING, "Received invalid %s packet with overflow in length fields "
-                "(channel_len:%u, message_len:%u)", clusterGetMessageTypeString(type), ch_len, msg_len);
-            return 1;
-        }
-        explen += ch_len + msg_len;
+        explen = clusterPublishMsgExpectedLen(&hdr->data.publish.msg, CLUSTERMSG_MIN_LEN, type);
+        if (explen == 0) return 1;
     } else if (type == CLUSTERMSG_TYPE_FAILOVER_AUTH_REQUEST ||
                type == CLUSTERMSG_TYPE_FAILOVER_AUTH_ACK ||
                type == CLUSTERMSG_TYPE_MFSTART)
@@ -3136,6 +3227,11 @@ int clusterProcessPacket(clusterLink *link) {
         if (!link->inbound && type == CLUSTERMSG_TYPE_PONG) {
             link->node->pong_received = now;
             link->node->ping_sent = 0;
+
+            /* Every message tells whether its sender can read the light
+             * header. We trust it on this link only once the node answered
+             * on it: a node restarted with an older version never gets it. */
+            link->light_hdr_supported = (hdr->mflags[0] & CLUSTERMSG_FLAG0_LIGHT_PUBSUB) != 0;
 
             /* The PFAIL condition can be reversed without external
              * help if it is momentary (that is, if it does not
@@ -3375,28 +3471,7 @@ int clusterProcessPacket(clusterLink *link) {
         }
     } else if (type == CLUSTERMSG_TYPE_PUBLISH || type == CLUSTERMSG_TYPE_PUBLISHSHARD) {
         if (!sender) return 1;  /* We don't know that node. */
-
-        robj *channel, *message;
-        uint32_t channel_len, message_len;
-
-        /* Don't bother creating useless objects if there are no
-         * Pub/Sub subscribers. */
-        if ((type == CLUSTERMSG_TYPE_PUBLISH
-            && serverPubsubSubscriptionCount() > 0)
-        || (type == CLUSTERMSG_TYPE_PUBLISHSHARD
-            && serverPubsubShardSubscriptionCount() > 0))
-        {
-            channel_len = ntohl(hdr->data.publish.msg.channel_len);
-            message_len = ntohl(hdr->data.publish.msg.message_len);
-            channel = createStringObject(
-                        (char*)hdr->data.publish.msg.bulk_data,channel_len);
-            message = createStringObject(
-                        (char*)hdr->data.publish.msg.bulk_data+channel_len,
-                        message_len);
-            pubsubPublishMessage(channel, message, type == CLUSTERMSG_TYPE_PUBLISHSHARD);
-            decrRefCount(channel);
-            decrRefCount(message);
-        }
+        clusterProcessPublishPacket(&hdr->data.publish.msg, type);
     } else if (type == CLUSTERMSG_TYPE_FAILOVER_AUTH_REQUEST) {
         if (!sender) return 1;  /* We don't know that node. */
         clusterSendFailoverAuthIfNeeded(sender,hdr);
@@ -3581,34 +3656,13 @@ void clusterReadHandler(connection *conn) {
 
     while(1) { /* Read as long as there is data to read. */
         rcvbuflen = link->rcvbuf_len;
-        if (rcvbuflen < 8) {
-            /* First, obtain the first 8 bytes to get the full message
-             * length. */
-            readlen = 8 - rcvbuflen;
+        if (rcvbuflen < RCVBUF_MIN_READ_LEN) {
+            /* First, obtain the first bytes to get the full message
+             * length and type. */
+            readlen = RCVBUF_MIN_READ_LEN - rcvbuflen;
         } else {
             /* Finally read the full message. */
             hdr = (clusterMsg*) link->rcvbuf;
-            if (rcvbuflen == 8) {
-                /* Perform some sanity check on the message signature
-                 * and length. */
-                if (memcmp(hdr->sig,"RCmb",4) != 0 ||
-                    ntohl(hdr->totlen) < CLUSTERMSG_MIN_LEN)
-                {
-                    char ip[NET_IP_STR_LEN];
-                    int port;
-                    if (connAddrPeerName(conn, ip, sizeof(ip), &port) == -1) {
-                        serverLog(LL_WARNING,
-                            "Bad message length or signature received "
-                            "on the Cluster bus.");
-                    } else {
-                        serverLog(LL_WARNING,
-                            "Bad message length or signature received "
-                            "on the Cluster bus from %s:%d", ip, port);
-                    }
-                    handleLinkIOError(link);
-                    return;
-                }
-            }
             readlen = ntohl(hdr->totlen) - rcvbuflen;
             if (readlen > sizeof(buf)) readlen = sizeof(buf);
         }
@@ -3639,8 +3693,30 @@ void clusterReadHandler(connection *conn) {
             rcvbuflen += nread;
         }
 
+        /* First bytes obtained? Perform some sanity check on the message
+         * signature and length, before reading or processing the rest. */
+        if (rcvbuflen == RCVBUF_MIN_READ_LEN) {
+            uint32_t minlen = (ntohs(hdr->type) & CLUSTERMSG_LIGHT) ?
+                              CLUSTERMSG_LIGHT_MIN_LEN : CLUSTERMSG_MIN_LEN;
+            if (memcmp(hdr->sig,"RCmb",4) != 0 || ntohl(hdr->totlen) < minlen) {
+                char ip[NET_IP_STR_LEN];
+                int port;
+                if (connAddrPeerName(conn, ip, sizeof(ip), &port) == -1) {
+                    serverLog(LL_WARNING,
+                        "Bad message length or signature received "
+                        "on the Cluster bus.");
+                } else {
+                    serverLog(LL_WARNING,
+                        "Bad message length or signature received "
+                        "on the Cluster bus from %s:%d", ip, port);
+                }
+                handleLinkIOError(link);
+                return;
+            }
+        }
+
         /* Total length obtained? Process this packet. */
-        if (rcvbuflen >= 8 && rcvbuflen == ntohl(hdr->totlen)) {
+        if (rcvbuflen >= RCVBUF_MIN_READ_LEN && rcvbuflen == ntohl(hdr->totlen)) {
             if (clusterProcessPacket(link)) {
                 if (link->rcvbuf_alloc > RCVBUF_INIT_LEN) {
                     size_t prev_rcvbuf_alloc = link->rcvbuf_alloc;
@@ -3676,7 +3752,7 @@ void clusterSendMessage(clusterLink *link, clusterMsgSendBlock *msgblock) {
     server.stat_cluster_links_memory += sizeof(listNode);
 
     /* Populate sent messages stats. */
-    uint16_t type = ntohs(getMessageFromSendBlock(msgblock)->type);
+    uint16_t type = ntohs(getMessageFromSendBlock(msgblock)->type) & ~CLUSTERMSG_LIGHT;
     if (type < CLUSTERMSG_TYPE_COUNT)
         server.cluster->stats_bus_messages_sent[type]++;
 }
@@ -3766,8 +3842,24 @@ static void clusterBuildMessageHdr(clusterMsg *hdr, int type, size_t msglen) {
         hdr->mflags[0] |= CLUSTERMSG_FLAG0_PAUSED;
     hdr->mflags[0] |= CLUSTERMSG_FLAG0_EXT_DATA; /* Always make other nodes know that
                                                   * this node supports extension data. */
+    if (server.cluster_light_hdr)
+        hdr->mflags[0] |= CLUSTERMSG_FLAG0_LIGHT_PUBSUB;
 
     hdr->totlen = htonl(msglen);
+}
+
+/* Build the light header (see clusterMsgLight). 'type' has the
+ * CLUSTERMSG_LIGHT bit set. hdr must point to a buffer at least
+ * CLUSTERMSG_LIGHT_MIN_LEN bytes long. */
+static void clusterBuildMessageHdrLight(clusterMsgLight *hdr, int type, size_t msglen) {
+    hdr->sig[0] = 'R';
+    hdr->sig[1] = 'C';
+    hdr->sig[2] = 'm';
+    hdr->sig[3] = 'b';
+    hdr->totlen = htonl(msglen);
+    hdr->ver = htons(CLUSTER_PROTO_VER);
+    hdr->type = htons(type);
+    memcpy(hdr->sender,myself->name,CLUSTER_NAMELEN);
 }
 
 /* Set the i-th entry of the gossip section in the message pointed by 'hdr'
@@ -3966,7 +4058,8 @@ void clusterBroadcastPong(int target) {
     dictResetIterator(&di);
 }
 
-/* Create a PUBLISH message block.
+/* Create a PUBLISH message block. If 'type' has the CLUSTERMSG_LIGHT bit set,
+ * the message gets the light header.
  *
  * Sanitizer suppression: In clusterMsgDataPublish, sizeof(bulk_data) is 8.
  * As all the struct is used as a buffer, when more than 8 bytes are copied into
@@ -3976,21 +4069,24 @@ REDIS_NO_SANITIZE("bounds")
 clusterMsgSendBlock *clusterCreatePublishMsgBlock(robj *channel, robj *message, uint16_t type) {
 
     uint32_t channel_len, message_len;
+    int light = type & CLUSTERMSG_LIGHT;
 
     channel = getDecodedObject(channel);
     message = getDecodedObject(message);
     channel_len = sdslen(channel->ptr);
     message_len = sdslen(message->ptr);
 
-    size_t msglen = sizeof(clusterMsg)-sizeof(union clusterMsgData);
+    size_t msglen = light ? CLUSTERMSG_LIGHT_MIN_LEN : CLUSTERMSG_MIN_LEN;
     msglen += sizeof(clusterMsgDataPublish) - 8 + channel_len + message_len;
     clusterMsgSendBlock *msgblock = createClusterMsgSendBlock(type, msglen);
 
-    clusterMsg *hdr = getMessageFromSendBlock(msgblock);
-    hdr->data.publish.msg.channel_len = htonl(channel_len);
-    hdr->data.publish.msg.message_len = htonl(message_len);
-    memcpy(hdr->data.publish.msg.bulk_data,channel->ptr,sdslen(channel->ptr));
-    memcpy(hdr->data.publish.msg.bulk_data+sdslen(channel->ptr),
+    clusterMsgDataPublish *publish = light ?
+        &getLightMessageFromSendBlock(msgblock)->data.publish.msg :
+        &getMessageFromSendBlock(msgblock)->data.publish.msg;
+    publish->channel_len = htonl(channel_len);
+    publish->message_len = htonl(message_len);
+    memcpy(publish->bulk_data,channel->ptr,sdslen(channel->ptr));
+    memcpy(publish->bulk_data+sdslen(channel->ptr),
         message->ptr,sdslen(message->ptr));
 
     decrRefCount(channel);
@@ -4090,30 +4186,67 @@ int clusterSendModuleMessageToTarget(const char *target, uint64_t module_id, uin
  * messages to hosts without receives for a given channel.
  * Otherwise:
  * Publish this message across the slot (primary/replica).
+ *
+ * Each node gets the message with the light header if its link can read it,
+ * with the full header otherwise. The two message blocks are created when
+ * first needed and shared by all the links.
  * -------------------------------------------------------------------------- */
+typedef struct {
+    robj *channel;
+    robj *message;
+    uint16_t type;
+    clusterMsgSendBlock *full;  /* Message with the full header */
+    clusterMsgSendBlock *light; /* Message with the light header */
+} clusterPublishBlocks;
+
+/* Queue the Pub/Sub message described by 'pb' on the link to 'node', creating
+ * the message block of the header that link can read if it is the first. */
+static void clusterSendPublish(clusterNode *node, clusterPublishBlocks *pb) {
+    if (node->flags & (CLUSTER_NODE_MYSELF|CLUSTER_NODE_HANDSHAKE) || !node->link)
+        return;
+
+    clusterMsgSendBlock **msgblock;
+    uint16_t type = pb->type;
+    if (server.cluster_light_hdr && node->link->light_hdr_supported) {
+        msgblock = &pb->light;
+        type |= CLUSTERMSG_LIGHT;
+    } else {
+        msgblock = &pb->full;
+    }
+    if (*msgblock == NULL)
+        *msgblock = clusterCreatePublishMsgBlock(pb->channel, pb->message, type);
+    clusterSendMessage(node->link, *msgblock);
+}
+
 void clusterPropagatePublish(robj *channel, robj *message, int sharded) {
-    clusterMsgSendBlock *msgblock;
+    clusterPublishBlocks pb = {
+        .channel = channel,
+        .message = message,
+        .type = sharded ? CLUSTERMSG_TYPE_PUBLISHSHARD : CLUSTERMSG_TYPE_PUBLISH,
+        .full = NULL,
+        .light = NULL,
+    };
 
     if (!sharded) {
-        msgblock = clusterCreatePublishMsgBlock(channel, message, CLUSTERMSG_TYPE_PUBLISH);
-        clusterBroadcastMessage(msgblock);
-        clusterMsgSendBlockDecrRefCount(msgblock);
-        return;
+        dictIterator di;
+        dictEntry *de;
+
+        dictInitSafeIterator(&di, server.cluster->nodes);
+        while((de = dictNext(&di)) != NULL)
+            clusterSendPublish(dictGetVal(de), &pb);
+        dictResetIterator(&di);
+    } else {
+        listIter li;
+        listNode *ln;
+        list *nodes_for_slot = clusterGetNodesInMyShard(server.cluster->myself);
+        serverAssert(nodes_for_slot != NULL);
+        listRewind(nodes_for_slot, &li);
+        while((ln = listNext(&li)))
+            clusterSendPublish(listNodeValue(ln), &pb);
     }
 
-    listIter li;
-    listNode *ln;
-    list *nodes_for_slot = clusterGetNodesInMyShard(server.cluster->myself);
-    serverAssert(nodes_for_slot != NULL);
-    listRewind(nodes_for_slot, &li);
-    msgblock = clusterCreatePublishMsgBlock(channel, message, CLUSTERMSG_TYPE_PUBLISHSHARD);
-    while((ln = listNext(&li))) {
-        clusterNode *node = listNodeValue(ln);
-        if (node->flags & (CLUSTER_NODE_MYSELF|CLUSTER_NODE_HANDSHAKE))
-            continue;
-        clusterSendMessage(node->link,msgblock);
-    }
-    clusterMsgSendBlockDecrRefCount(msgblock);
+    if (pb.full) clusterMsgSendBlockDecrRefCount(pb.full);
+    if (pb.light) clusterMsgSendBlockDecrRefCount(pb.light);
 }
 
 /* -----------------------------------------------------------------------------

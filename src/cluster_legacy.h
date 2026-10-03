@@ -53,6 +53,8 @@ typedef struct clusterLink {
     size_t rcvbuf_alloc;        /* Allocated size of rcvbuf */
     clusterNode *node;          /* Node related to this link. Initialized to NULL when unknown */
     int inbound;                /* 1 if this link is an inbound link accepted from the related node */
+    int light_hdr_supported;    /* 1 if the peer can read the light header, as it said in
+                                   its last PONG on this (outbound) link */
 } clusterLink;
 
 /* Cluster node flags and macros. */
@@ -289,12 +291,52 @@ static_assert(offsetof(clusterMsg, data) == 2256, "unexpected field offset");
 
 #define CLUSTERMSG_MIN_LEN (sizeof(clusterMsg)-sizeof(union clusterMsgData))
 
+/* Pub/Sub messages (PUBLISH and PUBLISHSHARD) can travel with a light header
+ * that only carries what the receiver needs to deliver them, instead of the
+ * full header above (2256 bytes, mostly the slots bitmap). A node announces
+ * that it can read it with CLUSTERMSG_FLAG0_LIGHT_PUBSUB, and gets it only on
+ * a link where it already answered with a PONG, so a node of an older version
+ * never sees it. The first fields have the same offsets as in clusterMsg: the
+ * receiver tells the two headers apart by the CLUSTERMSG_LIGHT bit of the
+ * type. Another message type that starts using the light header needs its
+ * own capability bit: nodes that only announce this one drop it. */
+#define CLUSTERMSG_LIGHT 0x8000
+
+union clusterMsgLightData {
+    /* PUBLISH and PUBLISHSHARD */
+    struct {
+        clusterMsgDataPublish msg;
+    } publish;
+};
+
+typedef struct {
+    char sig[4];        /* Signature "RCmb" (Redis Cluster message bus). */
+    uint32_t totlen;    /* Total length of this message */
+    uint16_t ver;       /* Protocol version, currently set to 1. */
+    uint16_t notused1;  /* Primary port in clusterMsg, unused here. */
+    uint16_t type;      /* Message type, with the CLUSTERMSG_LIGHT bit set. */
+    uint16_t notused2;  /* Count in clusterMsg, unused here. */
+    char sender[CLUSTER_NAMELEN]; /* Name of the sender node */
+    union clusterMsgLightData data;
+} clusterMsgLight;
+
+static_assert(offsetof(clusterMsgLight, sig) == offsetof(clusterMsg, sig), "unexpected field offset");
+static_assert(offsetof(clusterMsgLight, totlen) == offsetof(clusterMsg, totlen), "unexpected field offset");
+static_assert(offsetof(clusterMsgLight, ver) == offsetof(clusterMsg, ver), "unexpected field offset");
+static_assert(offsetof(clusterMsgLight, type) == offsetof(clusterMsg, type), "unexpected field offset");
+static_assert(offsetof(clusterMsgLight, sender) == 16, "unexpected field offset");
+static_assert(offsetof(clusterMsgLight, data) == 56, "unexpected field offset");
+
+#define CLUSTERMSG_LIGHT_MIN_LEN (sizeof(clusterMsgLight)-sizeof(union clusterMsgLightData))
+
 /* Message flags better specify the packet content or are used to
  * provide some information about the node state. */
 #define CLUSTERMSG_FLAG0_PAUSED (1<<0) /* Master paused for manual failover. */
 #define CLUSTERMSG_FLAG0_FORCEACK (1<<1) /* Give ACK to AUTH_REQUEST even if
                                             master is up. */
 #define CLUSTERMSG_FLAG0_EXT_DATA (1<<2) /* Message contains extension data */
+#define CLUSTERMSG_FLAG0_LIGHT_PUBSUB (1<<3) /* Sender can read Pub/Sub messages
+                                                with the light header. */
 
 struct _clusterNode {
     mstime_t ctime; /* Node object creation time. */

@@ -2693,6 +2693,8 @@ struct redisServer {
     unsigned long long cluster_link_msg_queue_limit_bytes;  /* Memory usage limit on individual link msg queue */
     int cluster_drop_packet_filter; /* Debug config that allows tactically
                                    * dropping packets of a specific type */
+    int cluster_light_hdr;          /* Announce and send the light header of Pub/Sub cluster
+                                     * bus messages (hidden config, 0 behaves like older versions) */
     int cluster_slot_stats_enabled; /* Cluster slot usage statistics tracking enabled. */
     /* Scripting */
     unsigned int lua_arena;         /* eval lua arena used in jemalloc. */

@@ -546,3 +546,19 @@ proc build_cluster_bus_header {sender_name sender_port sender_cport msg_type tot
 
     return $hdr
 }
+
+# Build the 56-byte light header that Pub/Sub messages use on the cluster bus
+# towards nodes that announce it: signature, length, version, the message type
+# with the light bit (0x8000) set, and the sender name. The payload is appended
+# after it.
+proc build_cluster_bus_light_header {sender_name msg_type totlen} {
+    set hdr ""
+    append hdr "RCmb"
+    append hdr [binary format I $totlen]
+    append hdr [binary format S 1]                            ;# ver
+    append hdr [binary format S 0]                            ;# unused
+    append hdr [binary format S [expr {$msg_type | 0x8000}]]  ;# type
+    append hdr [binary format S 0]                            ;# unused
+    append hdr [binary format a40 $sender_name]               ;# sender
+    return $hdr
+}
